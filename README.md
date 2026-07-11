@@ -1,47 +1,47 @@
 # TIF-Net
 
 
-## 项目结构
+## Project Structure
 
 ```angular2html
 TIF-Net/
-├── dataset/ # 数据集处理
-├── networks/ # 网络组件
-├── utils/ # 工具函数
-├── manopth/ # MANO PyTorch 实现
-├── model.py # 主模型
-└── traineval.py # 训练评估脚本
+├── dataset/          # Dataset processing
+├── networks/         # Network components
+├── utils/            # Utility functions
+├── manopth/          # MANO PyTorch implementation
+├── model.py          # Main model
+└── traineval.py      # Training & evaluation script
 ```
 
-## 安装
+## Installation
 
 ```bash
 pip install torch torchvision numpy scipy opencv-python
 ```
 
-## 训练
+## Training
 
 ```bash
-# HO3D数据集
+# HO3D dataset
 python traineval.py --use_ho3d --network honet_transformer --epochs 70
 
-# Dex-YCB数据集
+# Dex-YCB dataset
 python traineval.py --network honet_transformer --epochs 70
 ```
 
-## 评估
+## Evaluation
 
 ```bash
 python traineval.py --evaluate --resume ./exp-results/checkpoint.pth.tar
 ```
 
-## 主要参数
+## Main Arguments
 
-| 参数 | 说明 | 默认值 |
-|------|------|--------|
-| `--use_ho3d` | 使用HO3D数据集 | False |
-| `--network` | 网络架构 | honet_transformer |
-| `--epochs` | 训练轮数 | 70 |
-| `--lr` | 学习率 | 1e-4 |
-| `--train_batch` | 训练批次 | 64 |
-| `--host_folder` | 结果保存目录 | ./exp-results |
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--use_ho3d` | Use HO3D dataset | False |
+| `--network` | Network architecture | honet_transformer |
+| `--epochs` | Training epochs | 70 |
+| `--lr` | Learning rate | 1e-4 |
+| `--train_batch` | Training batch size | 64 |
+| `--host_folder` | Results save directory | ./exp-results |
