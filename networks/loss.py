@@ -41,7 +41,7 @@ class ManoLoss:
             num_stack = len(preds)
             for i, pred in enumerate(preds):
                 if self.lambda_verts3d is not None and "verts3d" in gts:
-                    mesh3d_loss = self.lambda_verts3d * F.mse_loss(pred["verts3d"], gts["verts3d"])
+                    mesh3d_loss = self.lambda_verts3d * F.l1_loss(pred["verts3d"], gts["verts3d"])
                     final_loss += mesh3d_loss
                     if i == num_stack - 1:
                         mano_losses["mano_mesh3d_loss"] = mesh3d_loss.detach().cpu()
@@ -74,7 +74,7 @@ class ManoLoss:
             mano_losses["mano_total_loss"] = final_loss.detach().cpu()
         else:
             if self.lambda_verts3d is not None and "verts3d" in gts:
-                mesh3d_loss = self.lambda_verts3d * F.mse_loss(preds["verts3d"], gts["verts3d"])
+                mesh3d_loss = self.lambda_verts3d * F.l1_loss(preds["verts3d"], gts["verts3d"])
                 final_loss += mesh3d_loss
                 mano_losses["mano_mesh3d_loss"] = mesh3d_loss.detach().cpu()
             if self.lambda_joints3d is not None and "joints3d" in gts:
@@ -132,7 +132,8 @@ class ObjectLoss:
 
         if obj_lossmask is None:
             reg_loss = self.obj_loss_func(reg_px, reg_label_x) + self.obj_loss_func(reg_py, reg_label_y)
-            conf_loss = self.obj_loss_func(reg_conf, conf_target)
+            conf_loss = F.binary_cross_entropy(
+                reg_conf.clamp(min=1e-6, max=1-1e-6), conf_target)
         else:
             obj_lossmask = obj_lossmask.view(-1, 1, 1, 1)
             reg_px = reg_px * obj_lossmask
@@ -142,7 +143,8 @@ class ObjectLoss:
             reg_conf = reg_conf * obj_lossmask
             conf_target = conf_target * obj_lossmask
             reg_loss = self.obj_loss_func(reg_px, reg_label_x) + self.obj_loss_func(reg_py, reg_label_y)
-            conf_loss = self.obj_loss_func(reg_conf, conf_target)
+            conf_loss = F.binary_cross_entropy(
+                reg_conf.clamp(min=1e-6, max=1-1e-6), conf_target)
             if obj_lossmask.sum() != 0:
                 reg_loss *= reg_px.shape[0] / obj_lossmask.sum()
                 conf_loss *= reg_px.shape[0] / obj_lossmask.sum()

@@ -20,16 +20,23 @@ def add_opts(parser):
                         help="Weight to supervise joints in 3d")
     parser.add_argument("--mano_lambda_verts3d", default=1e4, type=float,
                         help="Weight to supervise vertices in 3d")
-    parser.add_argument("--mano_lambda_manopose", default=10, type=float,
+    parser.add_argument("--mano_lambda_manopose", default=1500, type=float,
                         help="Weight to supervise mano pose parameters")
-    parser.add_argument("--mano_lambda_manoshape", default=0.1, type=float,
+    parser.add_argument("--mano_lambda_manoshape", default=1500, type=float,
                         help="Weight to supervise mano shape parameters")
     parser.add_argument("--mano_lambda_regulshape", default=0, type=float,
                         help="Weight to regularize hand shapes")
     parser.add_argument("--mano_lambda_regulpose", default=0, type=float,
                         help="Weight to regularize hand pose in axis-angle space")
-    parser.add_argument("--lambda_joints2d", default=1e2, type=float, help="Weight to supervise joints in 2d")
+    parser.add_argument("--lambda_joints2d", default=0.0, type=float, help="Weight to supervise joints in 2d")
+    parser.add_argument("--lambda_pose2d_heatmap", default=100.0, type=float,
+                        help="JSE heatmap supervision weight")
     parser.add_argument("--lambda_objects", default=5e2, type=float, help="Weight to supervise objects")
+    parser.add_argument("--interaction_mode", default="hand_to_object",
+                        choices=("none", "hand_to_object", "bidirectional"),
+                        help="interaction mode ablation")
+    parser.add_argument("--no_detach_interaction_source", action="store_true",
+                        help="Allow the cross-attention key/value source to receive gradients")
     parser.add_argument("--transformer_depth", default=1, type=int, help="transformer module depth")
     parser.add_argument("--transformer_head", default=4, type=int, help="transformer attention head")
 

@@ -151,7 +151,9 @@ def get_network(args):
                 transformer_depth=args.transformer_depth,
                 transformer_head=args.transformer_head,
                 coord_change_mat=coord_change_mat,
-                reg_object=True, pretrained=pretrained)
+                reg_object=True, pretrained=pretrained,
+                interaction_mode=args.interaction_mode,
+                detach_interaction_source=not args.no_detach_interaction_source)
 
     net = torch.nn.DataParallel(net)
 
@@ -162,7 +164,8 @@ def get_network(args):
                     mano_lambda_regulshape=args.mano_lambda_regulshape,
                     mano_lambda_regulpose=args.mano_lambda_regulpose,
                     lambda_joints2d=args.lambda_joints2d,
-                    lambda_objects=args.lambda_objects)
+                    lambda_objects=args.lambda_objects,
+                    lambda_pose2d_heatmap=args.lambda_pose2d_heatmap)
 
     return model
 

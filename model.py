@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torchvision import ops
 from networks.backbone_share import FPN
 from networks.hand_head import hand_Encoder, hand_regHead
@@ -25,24 +26,26 @@ class Lightweight2DPoseBranch(nn.Module):
         self.conv2.apply(weights_init_kaiming)
         self.conv3.apply(init_weights)
 
-    def forward(self, x):
-
+    def forward(self, x, return_logits=False):
         x = self.relu(self.conv1(x))
         x = self.relu(self.conv2(x))
-        heatmap = self.sigmoid(self.conv3(x))
-        return heatmap
+        logits = self.conv3(x)
+        heatmap = self.sigmoid(logits)
+        return (logits, heatmap) if return_logits else heatmap
 
-def heatmap_to_2d_joints(heatmap, img_size=(512, 512)):
-    B, J, H, W = heatmap.shape
-
-    heatmap_flat = heatmap.reshape(B, J, -1)
-    max_idx = torch.argmax(heatmap_flat, dim=-1)
-
-    x = (max_idx % W) * (img_size[0] / W)
-    y = (max_idx // W) * (img_size[1] / H)
-
-    joints_2d = torch.stack([x, y], dim=-1)
-    return joints_2d
+def heatmap_to_2d_joints(logits):
+    b, j, height, width = logits.shape
+    probs = torch.softmax(logits.flatten(2), dim=-1).reshape(b, j, height, width)
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=logits.device, dtype=logits.dtype),
+        torch.arange(width, device=logits.device, dtype=logits.dtype),
+        indexing="ij",
+    )
+    coords = torch.stack([
+        (probs * xx).sum(dim=(-2, -1)),
+        (probs * yy).sum(dim=(-2, -1))
+    ], dim=-1)
+    return coords, probs
 
 def init_weights(m):
     if type(m) == nn.ConvTranspose2d:
@@ -75,17 +78,25 @@ class HONet(nn.Module):
     def __init__(self, roi_res=32, joint_nb=21, stacks=1, channels=256, blocks=1,
                  transformer_depth=1, transformer_head=8,
                  mano_layer=None, mano_neurons=[1024, 512], coord_change_mat=None,
-                 reg_object=True, pretrained=True):
+                 reg_object=True, pretrained=True,
+                 interaction_mode="hand_to_object",
+                 detach_interaction_source=True):
 
         super(HONet, self).__init__()
 
         self.out_res = roi_res
         self.joint_nb = joint_nb
         self.inp_channels = channels
+        allowed = {"none", "hand_to_object", "bidirectional"}
+        if interaction_mode not in allowed:
+            raise ValueError("interaction_mode must be one of: {}".format(sorted(allowed)))
+        self.interaction_mode = interaction_mode
+        self.detach_interaction_source = detach_interaction_source
 
         self.base_net = FPN(pretrained=pretrained)
 
-        self.HTPE = KnowledgeGuidedModule(2, 1024)
+        self.HTPE = KnowledgeGuidedModule(2, 1024, order=2)
+        self.topology_projection = nn.Linear(1024, channels)
 
         self.BVTF = CrossAttention(channel_a=256, channel_b=256, out_channel=256)
 
@@ -110,91 +121,84 @@ class HONet(nn.Module):
 
         self.transformer_obj = Transformer(inp_res=roi_res, dim=channels, depth=transformer_depth,
                                            num_heads=transformer_head)
-        self.transformer_hand = Transformer(inp_res=roi_res, dim=channels * 2, depth=transformer_depth,
-                                            num_heads=transformer_head)
+        self.transformer_obj_to_hand = (
+            Transformer(inp_res=roi_res, dim=channels, depth=transformer_depth,
+                        num_heads=transformer_head)
+            if interaction_mode == "bidirectional" else None)
 
         self.hand_head.apply(init_weights)
         self.hand_encoder.apply(init_weights)
         self.mano_branch.apply(init_weights)
         self.transformer_obj.apply(init_weights)
-        self.transformer_hand.apply(init_weights)
+        if self.transformer_obj_to_hand is not None:
+            self.transformer_obj_to_hand.apply(init_weights)
         self.obj_head.apply(init_weights)
         self.HTPE.apply(init_weights)
         self.pose2d_branch.apply(init_weights)
 
     def net_forward(self, imgs, bbox_hand, bbox_obj, mano_params=None, roots3d=None):
-        batch = self.new_method(imgs)
-
-        inter_topLeft = torch.max(bbox_hand[:, :2], bbox_obj[:, :2])
-        inter_bottomRight = torch.min(bbox_hand[:, 2:], bbox_obj[:, 2:])
-        bbox_inter = torch.cat((inter_topLeft, inter_bottomRight), dim=1)
-        msk_inter = ((inter_bottomRight - inter_topLeft > 0).sum(dim=1)) == 2
-
-        P2_h, P2_o = self.base_net(imgs)
-
-        pose2d_heatmap = self.pose2d_branch(P2_h)
-
-        img_size = (imgs.shape[3], imgs.shape[2])
-        pred_joints2d = heatmap_to_2d_joints(pose2d_heatmap, img_size=img_size)
-
-        hand_topology_prior = self.HTPE(pred_joints2d)
-
-        hand_topology_prior = hand_topology_prior.mean(dim=1)
-        hand_topology_prior = nn.Linear(1024, 256).to(hand_topology_prior.device)(hand_topology_prior)
-
-        hand_topology_feat = hand_topology_prior.unsqueeze(-1).unsqueeze(-1)
-
-        hand_topology_feat = torch.nn.functional.interpolate(
-            hand_topology_feat,
-            size=(self.out_res, self.out_res),
-            mode='bilinear',
-            align_corners=False
-        )
-
-        idx_tensor = torch.arange(batch, device=imgs.device).float().view(-1, 1)
-
+        batch = imgs.shape[0]
+        idx_tensor = torch.arange(batch, device=imgs.device, dtype=bbox_hand.dtype).view(-1, 1)
         roi_boxes_hand = torch.cat((idx_tensor, bbox_hand), dim=1)
+        p2_hand, p2_object = self.base_net(imgs)
 
-        x_hand = ops.roi_align(P2_h, roi_boxes_hand, output_size=(self.out_res, self.out_res), spatial_scale=1.0 / 4.0,
-                               sampling_ratio=-1)
+        x_hand = ops.roi_align(
+            p2_hand, roi_boxes_hand, output_size=(self.out_res, self.out_res),
+            spatial_scale=1.0 / 4.0, sampling_ratio=-1)
+        pose_logits, pose2d_heatmap = self.pose2d_branch(x_hand, return_logits=True)
+        pred_joints2d, normalized_heatmaps = heatmap_to_2d_joints(pose_logits)
 
-        x_obj = ops.roi_align(P2_o, roi_boxes_hand, output_size=(self.out_res, self.out_res), spatial_scale=1.0 / 4.0,
-                              sampling_ratio=-1)
+        node_features = self.topology_projection(self.HTPE(pred_joints2d))
+        topology_map = torch.einsum("bjhw,bjc->bchw", normalized_heatmaps, node_features)
+        fused_hand_feat = self.BVTF(FI=x_hand, FP=topology_map)
 
-        fused_hand_feat = self.BVTF(FI=x_hand, FP=hand_topology_feat)
-
+        preds_obj = None
         if self.reg_object:
             roi_boxes_obj = torch.cat((idx_tensor, bbox_obj), dim=1)
-            roi_boxes_inter = torch.cat((idx_tensor, bbox_inter), dim=1)
+            y_object = ops.roi_align(
+                p2_object, roi_boxes_obj, output_size=(self.out_res, self.out_res),
+                spatial_scale=1.0 / 4.0, sampling_ratio=-1)
 
-            y = ops.roi_align(P2_o, roi_boxes_obj, output_size=(self.out_res, self.out_res), spatial_scale=1.0 / 4.0,
-                              sampling_ratio=-1)
+            inter_topleft = torch.maximum(bbox_hand[:, :2], bbox_obj[:, :2])
+            inter_bottomright = torch.minimum(bbox_hand[:, 2:], bbox_obj[:, 2:])
+            valid_inter = ((inter_bottomright - inter_topleft) > 0).all(dim=1)
+            bbox_inter_safe = torch.where(
+                valid_inter[:, None],
+                torch.cat((inter_topleft, inter_bottomright), dim=-1),
+                bbox_hand)
+            roi_boxes_inter = torch.cat((idx_tensor, bbox_inter_safe), dim=1)
+            x_overlap = ops.roi_align(
+                p2_hand, roi_boxes_inter, output_size=(self.out_res, self.out_res),
+                spatial_scale=1.0 / 4.0, sampling_ratio=-1)
+            x_overlap = valid_inter[:, None, None, None] * x_overlap
 
-            z_x = ops.roi_align(P2_h, roi_boxes_inter, output_size=(self.out_res, self.out_res),
-                                spatial_scale=1.0 / 4.0,
-                                sampling_ratio=-1)
+            if self.interaction_mode == "none":
+                enhanced_object = y_object
+            else:
+                hand_key_value = (
+                    x_overlap.detach() if self.detach_interaction_source else x_overlap)
+                candidate_object = self.transformer_obj(y_object, hand_key_value)
+                enhanced_object = torch.where(
+                    valid_inter[:, None, None, None], candidate_object, y_object)
 
-            z_x = msk_inter[:, None, None, None] * z_x
+            if self.interaction_mode == "bidirectional":
+                object_key_value = (
+                    y_object.detach() if self.detach_interaction_source else y_object)
+                candidate_hand = self.transformer_obj_to_hand(
+                    fused_hand_feat, object_key_value)
+                fused_hand_feat = torch.where(
+                    valid_inter[:, None, None, None], candidate_hand, fused_hand_feat)
 
-            hand_obj = torch.cat([x_hand, x_obj.detach()], dim=1)
-            hand_obj = self.transformer_hand(hand_obj, hand_obj)
-
-            y = self.transformer_obj(y, z_x.detach())
-
-            out_fm = self.obj_head(y)
+            out_fm = self.obj_head(enhanced_object)
             preds_obj = self.obj_reorgLayer(out_fm)
-        else:
-            preds_obj = None
 
-        hand = fused_hand_feat[:, 0:256, :, :]
-
-        out_hm, encoding, preds_joints = self.hand_head(hand)
-
+        out_hm, encoding, preds_joints = self.hand_head(fused_hand_feat)
         mano_encoding = self.hand_encoder(out_hm, encoding)
+        pred_mano_results, gt_mano_results = self.mano_branch(
+            mano_encoding, mano_params=mano_params, roots3d=roots3d)
 
-        pred_mano_results, gt_mano_results = self.mano_branch(mano_encoding, mano_params=mano_params, roots3d=roots3d)
-
-        return preds_joints, pred_mano_results, gt_mano_results, preds_obj, pose2d_heatmap, pred_joints2d
+        return (preds_joints, pred_mano_results, gt_mano_results,
+                preds_obj, pose2d_heatmap, pred_joints2d)
 
     def new_method(self, imgs):
         batch = imgs.shape[0]
@@ -274,8 +278,17 @@ class HOModel(nn.Module):
             else:
                 losses["total_loss"] = 0
 
+            if self.lambda_pose2d_heatmap > 0 and pose2d_heatmap_gt is None:
+                raise ValueError(
+                    "JSE supervision is enabled but pose2d_heatmap_gt is missing. "
+                    "The dataset loader must generate Gaussian heatmaps in the hand RoI.")
             if pose2d_heatmap_gt is not None:
-
+                if pose2d_heatmap.shape != pose2d_heatmap_gt.shape:
+                    raise ValueError(
+                        "JSE heatmap GT must have shape {}, got {}. "
+                        "Generate Gaussian targets in hand RoI coordinates."
+                        .format(tuple(pose2d_heatmap.shape),
+                                tuple(pose2d_heatmap_gt.shape)))
                 pose2d_loss = self.pose2d_heatmap_loss(pose2d_heatmap, pose2d_heatmap_gt)
                 pose2d_loss = pose2d_loss * self.lambda_pose2d_heatmap
                 losses["pose2d_heatmap_loss"] = pose2d_loss.detach().cpu()

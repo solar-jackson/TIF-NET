@@ -1,44 +1,58 @@
-import os
-import sys
-from networks.graph_utils import *
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-sys.path.append(os.path.abspath('./common/nets'))
+HAND_KINEMATIC_EDGES = (
+    (0, 1), (0, 5), (0, 9), (0, 13), (0, 17),
+    (1, 2), (2, 3), (3, 4), (5, 6), (6, 7), (7, 8),
+    (9, 10), (10, 11), (11, 12), (13, 14), (14, 15),
+    (15, 16), (17, 18), (18, 19), (19, 20),
+)
 
-def get_graph_L():
-    mano = MANO()
-    joint_hori_conn = (
-    (1, 5), (5, 9), (9, 13), (13, 17), (2, 6), (6, 10), (10, 14), (14, 18), (3, 7), (7, 11), (11, 15), (15, 19), (4, 8),
-    (8, 12), (12, 16), (16, 20))
-    graph_Adj, graph_L = build_graphs(joint_num=21, skeleton=mano.skeleton, flip_pairs=joint_hori_conn)
-    return graph_L
+def scaled_hand_laplacian(joints=21):
+    if joints != 21:
+        raise ValueError("The predefined graph supports the 21-joint convention only.")
+    adj = torch.zeros(joints, joints, dtype=torch.float32)
+    for i, j in HAND_KINEMATIC_EDGES:
+        adj[i, j] = adj[j, i] = 1.0
+    deg = adj.sum(dim=1)
+    invsqrt = deg.clamp_min(1).rsqrt()
+    return -(invsqrt[:, None] * adj * invsqrt[None, :])
+
+class ChebyshevGraphConv(nn.Module):
+    def __init__(self, in_channels, out_channels, order=2):
+        super().__init__()
+        if order < 2:
+            raise ValueError("order >= 2 is required to propagate neighbor information.")
+        self.order = order
+        self.linear = nn.Linear(order * in_channels, out_channels)
+        self.norm = nn.BatchNorm1d(out_channels)
+
+    def forward(self, x, laplacian):
+        cheb = [x]
+        if self.order > 1:
+            cheb.append(torch.einsum("ij,bjf->bif", laplacian, x))
+        for _ in range(2, self.order):
+            cheb.append(2 * torch.einsum("ij,bjf->bif", laplacian, cheb[-1]) - cheb[-2])
+        y = self.linear(torch.cat(cheb, dim=-1))
+        b, j, d = y.shape
+        return F.relu(self.norm(y.reshape(b * j, d)).reshape(b, j, d))
 
 class KnowledgeGuidedModule(nn.Module):
-    def __init__(self, in_channel, out_channel):
+    def __init__(self, in_channel=2, out_channel=1024, order=2,
+                 widths=(1024, 2048, 2048)):
         super().__init__()
+        self.register_buffer("laplacian", scaled_hand_laplacian(), persistent=True)
+        features = (in_channel,) + tuple(widths) + (out_channel,)
+        self.layers = nn.ModuleList([
+            ChebyshevGraphConv(features[i], features[i+1], order=order)
+            for i in range(len(features)-1)
+        ])
 
-        self.graph_L = get_graph_L()
-
-        self.CL_K = [1, 1, 1, 1]
-        self.CL_F = [in_channel, 1024, 2048, 2048, out_channel]
-        _cl = []
-        _bn = []
-        for i in range(len(self.CL_K)):
-            Fin = self.CL_K[i] * self.CL_F[i]
-            Fout = self.CL_F[i + 1]
-
-            _cl.append(nn.Linear(Fin, Fout))
-            scale = np.sqrt(2.0 / (Fin + Fout))
-            _cl[-1].weight.data.uniform_(-scale, scale)
-            _cl[-1].bias.data.fill_(0.0)
-
-            _bn.append(nn.BatchNorm1d(Fout))
-
-        self.cl = nn.ModuleList(_cl)
-        self.bn = nn.ModuleList(_bn)
-
-    def forward(self, kypt_feats):
-        for i in range(len(self.CL_K)):
-            kypt_feats = graph_conv_cheby(kypt_feats, self.cl[i], self.bn[i], self.graph_L, self.CL_F[i + 1],
-                                          self.CL_K[i])
-
-        return kypt_feats
+    def forward(self, joints_2d):
+        if joints_2d.ndim != 3 or joints_2d.shape[1:] != (21, 2):
+            raise ValueError("Expected [batch,21,2] joint coordinates.")
+        x = joints_2d
+        for layer in self.layers:
+            x = layer(x, self.laplacian)
+        return x
